@@ -14,7 +14,10 @@
 #                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
 # -WindowsBarMB    maximum MiB of title memory windows in CPU-mapped VRAM (by default 3072 on PCs with under
 #                  24 GB of RAM, else 0; -WindowsBarMB 0 turns it off).
-# -More            other settings: -More @{VICTORY_PANEL='1'}
+# -CardBuffersMinKB  smallest title buffer, in KiB, whose copy and compares go to the card's memory (by default 64
+#                  on cards with 8 GB of VRAM or less, else the 1 MiB of VICTORY_CARD_BUFFERS_MIN_MB;
+#                  -CardBuffersMinKB 0 keeps 1 MiB).
+# -More           other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -26,8 +29,25 @@ param(
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [uint32]$WindowsBarMB
+    [uint32]$WindowsBarMB,
+    [uint32]$CardBuffersMinKB
 )
+
+# Dedicated memory in bytes of the card -Adapter names by part of its name, else of the NVIDIA card with the most
+# (Windows' display class keys; Win32_VideoController stops at 4 GB). 0 when it cannot be read.
+function Get-CardMemory([string]$adapterName) {
+    $class = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+    $cards = try {
+        Get-ChildItem -LiteralPath $class -ErrorAction Stop | Where-Object { $_.PSChildName -match '^\d{4}$' } | ForEach-Object {
+            $key = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+            $bytes = $key.'HardwareInformation.qwMemorySize'
+            if ($key.DriverDesc -and $bytes) { [pscustomobject]@{ Name = [string]$key.DriverDesc; Bytes = [uint64]$bytes } }
+        }
+    } catch { @() }
+    $pattern = if ($adapterName -and -not $adapterName.StartsWith('#')) { "*$adapterName*" } else { '*NVIDIA*' }
+    $match = @($cards | Where-Object { $_.Name -like $pattern } | Sort-Object Bytes -Descending)
+    if ($match.Count -gt 0) { $match[0].Bytes } else { 0 }
+}
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_CARD_STEPS = '2'
@@ -95,6 +115,20 @@ if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
     if ($ram -gt 0 -and $ram -lt 24GB) {
         $settings.VICTORY_WINDOWS_BAR_MB = '3072'
         Write-Host "$([math]::Round($ram / 1GB)) GB of RAM: title memory windows in the card's memory the CPU maps, up to 3 GB (-WindowsBarMB 0 turns this off)"
+    }
+}
+if ($PSBoundParameters.ContainsKey('CardBuffersMinKB')) {
+    if ($CardBuffersMinKB -gt 0) {
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = $CardBuffersMinKB.ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+} else {
+    # On 8 GB cards every copy of a title buffer is under 1 MiB (341-392 ranges of about 90 KB a frame), so
+    # VICTORY_CARD_BUFFERS_MIN_MB=1 moved none of them and shaders reached them over the bus. From 64 KiB up on the
+    # card: RTX 3070 8 GB, Series S 720p Quality, 10.5 -> 14.5 fps, GPU 51.6 -> 27.4 ms a frame (issue #1).
+    $vram = Get-CardMemory $Adapter
+    if ($vram -gt 0 -and $vram -le 8GB) {
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+        Write-Host "$(($vram / 1GB).ToString('0.#', [Globalization.CultureInfo]::InvariantCulture)) GB card: title buffers from 64 KiB up in the card's memory (-CardBuffersMinKB 0 turns this off)"
     }
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }

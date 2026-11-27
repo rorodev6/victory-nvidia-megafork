@@ -17,6 +17,21 @@ cargo build --locked --profile diag -p victory --features diagnostics
 
 Compare against the same command without `-Quality` after establishing the baseline. Record the commit, GPU, driver, CPU, RAM, cache state, internal and output resolution, and render settings. Capture the opening close-up and a fixed city route on RTX 5070, 4080/4090 and 5080-class hardware where available. Compare median and p95 frame times, missing faces or geometry, and device losses. Keep generated frames separate from rendered FPS.
 
+## 8 GB cards
+
+On 8 GB cards every copy of a title buffer is under 1 MiB, so `VICTORY_CARD_BUFFERS_MIN_MB=1` moves none of them to the card and shaders reach them over the bus ([issue #1](https://github.com/rorodev6/victory-nvidia-megafork/issues/1)). `play-nvidia.ps1` sets `VICTORY_CARD_BUFFERS_MIN_KB=64` on cards with 8 GB of VRAM or less; `-CardBuffersMinKB 0` turns it off.
+
+RTX 3070 8 GB (driver 610.88), Ryzen 7 9700X, 32 GB RAM, Windows 11 26200, commit `79f36b3`, Series S, `-Quality -Resolution 720 -NoSmoothMotion`, warm cache, one run each of the same mission. Gameplay samples only (500 or more draws a frame):
+
+| Settings | Run | Median fps | Median frame | p95 frame | Median GPU time |
+|---|---|---|---|---|---|
+| Baseline | 14 min | 10.5 | 95.4 ms | 121.7 ms | 51.6 ms |
+| `-WindowsBarMB 3072` | 31 min | 9.9 | 100.8 ms | 136.9 ms | 50.6 ms |
+| `-WindowsBarMB 3072`, `MIN_KB=64` | 18 min | 12.7 | 79.2 ms | 106.1 ms | 34.4 ms |
+| `MIN_KB=64` | 7 min | 14.5 | 69.0 ms | 92.9 ms | 27.4 ms |
+
+No device loss, out-of-memory error or panic in any run; the same 9 pipelines were refused in each. The gain is in GPU time, not in preparing frames. `-WindowsBarMB 3072` did not help on this card: its windows take VRAM the textures need. The routes were not identical and the last run is short, so read differences under about 5 % as noise.
+
 ## Sharing code with the AMD megafork
 
 The NVIDIA line and the [AMD line](https://github.com/rorodev6/victory-megafork-amd) have a common ancestor (`0a435665`), but their renderers have diverged. Port focused patches and run the appropriate tests on each base. Maintain separate launch defaults for shader wave execution, descriptor budgets and upscaling. Compare related fixes on both GPUs before treating them as cross-vendor defaults.
