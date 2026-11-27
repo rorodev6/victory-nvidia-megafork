@@ -33,6 +33,14 @@ pub fn set_image_path(base: usize, path: &Path) {
     paths.push((base, path));
 }
 
+/// Tells the GPU side about a title DLL the title loaded, so a console
+/// pipeline description carrying only raw shader code can find the embedded
+/// container it came from (the AMD upscaler's ACO path).
+#[cfg(windows)]
+pub fn register_shader_image(name: &str, base: usize, size: usize) {
+    victory_gpu::pipeline::register_title_image(name, base, size);
+}
+
 /// Forgets a title image that was unmapped again.
 pub fn forget_image(base: usize) {
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());

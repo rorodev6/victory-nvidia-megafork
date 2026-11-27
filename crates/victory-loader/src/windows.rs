@@ -208,6 +208,11 @@ impl LoadedImage {
         self.module as usize
     }
 
+    /// The image's size as the loader mapped it.
+    pub fn size(&self) -> usize {
+        self.info.size_of_image as usize
+    }
+
     /// Parsed from the original image (imports, entry point, TLS callbacks).
     pub fn info(&self) -> &ImageInfo {
         &self.info

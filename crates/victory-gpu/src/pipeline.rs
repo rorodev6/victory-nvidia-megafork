@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{
+    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid,
+};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -663,6 +665,242 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// A `DXBC` container found in a title DLL, with the hash of the compute
+/// code inside its `ACCC` part. The AMD upscaler passes that code on its own
+/// to `DeserializeComputePipelineStateX`; the metadata beside it in the DLL
+/// is what the translator needs.
+#[cfg(windows)]
+struct EmbeddedContainer {
+    code_hash: [u8; 32],
+    code_len: usize,
+    bytes: Vec<u8>,
+}
+
+/// Title DLLs loaded by the title, to look for embedded shader containers.
+#[cfg(windows)]
+static TITLE_IMAGES: Mutex<Vec<(String, usize, usize)>> = Mutex::new(Vec::new());
+
+/// Built on demand from [`TITLE_IMAGES`]; cleared when an image is added.
+#[cfg(windows)]
+static EMBEDDED: Mutex<Option<Vec<EmbeddedContainer>>> = Mutex::new(None);
+
+/// Remembers a title DLL the title loaded, so a console pipeline description
+/// that carries only raw shader code can find the container it came from.
+#[cfg(windows)]
+pub fn register_title_image(name: &str, base: usize, size: usize) {
+    let mut images = TITLE_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    if images.iter().any(|(_, at, _)| *at == base) {
+        return;
+    }
+    images.push((name.to_owned(), base, size));
+    *EMBEDDED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The container in the registered title images whose `ACCC` code is
+/// `code`; `None` when no image carries it.
+#[cfg(windows)]
+fn embedded_container(code: &[u8]) -> Option<Vec<u8>> {
+    let hash = blake3::hash(code);
+    let mut cache = EMBEDDED.lock().unwrap_or_else(|e| e.into_inner());
+    let list = cache.get_or_insert_with(|| {
+        let images = TITLE_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut found = Vec::new();
+        for (_, base, size) in images.iter() {
+            let mut image = vec![0u8; *size];
+            crate::host::read_there(*base as *const u8, &mut image);
+            let mut at = 0usize;
+            while at + 4 <= image.len() {
+                if image[at..at + 4] != *b"DXBC" {
+                    at += 4;
+                    continue;
+                }
+                let Ok(container) = victory_shader::Container::parse(&image[at..]) else {
+                    at += 4;
+                    continue;
+                };
+                let Some(part) = container.part(victory_shader::FourCC::ACCC) else {
+                    at += 4;
+                    continue;
+                };
+                let Ok(program) = victory_shader::native::fspx_program(part.data) else {
+                    at += 4;
+                    continue;
+                };
+                let total = container
+                    .parts
+                    .iter()
+                    .map(|p| p.offset + 8 + p.data.len())
+                    .max()
+                    .unwrap_or(0);
+                if total == 0 || at + total > image.len() {
+                    at += 4;
+                    continue;
+                }
+                found.push(EmbeddedContainer {
+                    code_hash: *blake3::hash(&program.code).as_bytes(),
+                    code_len: program.code.len(),
+                    bytes: image[at..at + total].to_vec(),
+                });
+                at += total.max(4);
+            }
+        }
+        found
+    });
+    list.iter()
+        .find(|c| c.code_len == code.len() && c.code_hash == *hash.as_bytes())
+        .map(|c| c.bytes.clone())
+}
+
+/// The console's `DeserializeComputePipelineStateX` (device method 0x218).
+/// The description's words 5 and 6 are a shader container and its size on
+/// the title's side: the AMD FidelityFX upscaler passes the `ACCC` part its
+/// ACO path extracted, while other titles pass the whole `DXBC` container.
+/// A container the translator knows becomes an ordinary pipeline; anything
+/// else is refused as this method always was, so callers keep their old
+/// fallback.
+///
+/// The console's own description also carries the pipeline registers and a
+/// root signature, but the translated shader declares the root layout it
+/// reads (`emit`), so those are not needed here.
+pub(crate) extern "system" fn deserialize_compute(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    #[cfg(windows)]
+    {
+        let Some(container) = console_compute_container(desc) else {
+            tracing::debug!("console compute pipeline state: no ACO shader container");
+            return E_NOTIMPL;
+        };
+        let head = ComputeHead {
+            root: std::ptr::null_mut(),
+            stage: Bytecode {
+                code: container.as_ptr(),
+                size: container.len(),
+            },
+        };
+        tracing::info!(
+            bytes = container.len(),
+            "console compute pipeline state from its ACO shader container"
+        );
+        create_compute(std::ptr::null_mut(), &head, iid, out)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (desc, iid, out);
+        E_NOTIMPL
+    }
+}
+
+/// The shader container at words 5 and 6 of a console compute pipeline
+/// description, when it is one the translator can read: a whole `DXBC`
+/// container with an `ACCC` part, or the `ACCC`/`FSPX` part on its own.
+#[cfg(windows)]
+fn console_compute_container(desc: *const u8) -> Option<Vec<u8>> {
+    use crate::host::read_into;
+
+    if desc.is_null() {
+        return None;
+    }
+    let mut words = [0u8; 128];
+    if !read_into(desc, &mut words) {
+        return None;
+    }
+    let word = |i: usize| {
+        u64::from_le_bytes(
+            words[i * 8..i * 8 + 8]
+                .try_into()
+                .expect("eight bytes of the description"),
+        )
+    };
+    let (code, size) = (word(5), word(6));
+    if code < 0x10000 || !(4..=64 << 20).contains(&size) {
+        return None;
+    }
+    let mut magic = [0u8; 4];
+    if !read_into(code as *const u8, &mut magic) {
+        return None;
+    }
+
+    // Useful when another title's description is not laid out this way.
+    if let Some(dir) = std::env::var_os("VICTORY_PIPELINE_DUMP") {
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("desc-{code:x}-{size:x}.bin")), words);
+        let mut head = [0u8; 256];
+        let n = size.min(head.len() as u64) as usize;
+        if read_into(code as *const u8, &mut head[..n]) {
+            let _ = std::fs::write(dir.join(format!("blob-{code:x}-{size:x}.bin")), &head[..n]);
+        }
+    }
+
+    match &magic {
+        b"FSPX" => {
+            let mut part = vec![0u8; usize::try_from(size).ok()?];
+            if !read_into(code as *const u8, &mut part) {
+                return None;
+            }
+            Some(wrap_accc(&part))
+        }
+        b"DXBC" => {
+            let mut header = [0u8; 0x20];
+            if !read_into(code as *const u8, &mut header) {
+                return None;
+            }
+            let total = u32::from_le_bytes(
+                header[0x18..0x1c]
+                    .try_into()
+                    .expect("four bytes of the container header"),
+            ) as usize;
+            if !(0x20..=64 << 20).contains(&total) {
+                return None;
+            }
+            let mut container = vec![0u8; total];
+            if !read_into(code as *const u8, &mut container) {
+                return None;
+            }
+            let parsed = victory_shader::Container::parse(&container).ok()?;
+            parsed.part(victory_shader::FourCC::ACCC)?;
+            Some(container)
+        }
+        _ => {
+            // The upscaler's ACO path passes the `ACCC` code on its own;
+            // find the metadata beside it in the title DLL that carried it.
+            if size > 1 << 20 {
+                return None;
+            }
+            let mut raw = vec![0u8; usize::try_from(size).ok()?];
+            if !read_into(code as *const u8, &mut raw) {
+                return None;
+            }
+            embedded_container(&raw)
+        }
+    }
+}
+
+/// Wraps an `ACCC` part (`FSPX`) in the `DXBC` container the translator
+/// reads, as the upscaler's ACO path passes the part rather than the whole
+/// container.
+#[cfg(windows)]
+fn wrap_accc(part: &[u8]) -> Vec<u8> {
+    let header = 0x24usize;
+    let total = header + 8 + part.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"DXBC");
+    out.extend_from_slice(&[0u8; 16]);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(header as u32).to_le_bytes());
+    out.extend_from_slice(b"ACCC");
+    out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    out.extend_from_slice(part);
+    out
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -920,5 +1158,22 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// The upscaler's ACO path passes an `ACCC` part on its own; the
+    /// wrapper has to read back as the same part.
+    #[cfg(windows)]
+    #[test]
+    fn an_accc_part_wrapped_in_dxbc_reads_back() {
+        let part = b"FSPX\x01\x00\x00\x00";
+        let container = wrap_accc(part);
+        let parsed = victory_shader::Container::parse(&container).expect("wrapped DXBC");
+        assert_eq!(
+            parsed
+                .part(victory_shader::FourCC::ACCC)
+                .expect("ACCC part")
+                .data,
+            part
+        );
     }
 }
