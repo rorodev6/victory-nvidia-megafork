@@ -149,6 +149,20 @@ RTX 5070 12 GB with a Ryzen 7 9800X3D, in the prologue:
     written by the decoder through another view of the same memory, judged
     clean when the frame was recorded, and copied a list late: frames from the
     ring showed out of order. Video planes now always record their copy.
+16. **FSR4's ACO shaders** (`crates/victory-gpu/src/pipeline.rs`, `device.rs`,
+    `crates/victory-hle/src/runtime.rs`, `crates/victory-loader/src/windows.rs`).
+    The Series S title's FSR4 upscaler asks the console device to deserialize
+    compute pipelines from its own ACO-cooked code
+    (`DeserializeComputePipelineStateX`, device slot 0x218). The runtime now
+    finds the matching `ACCC`/`FSPX` container in the loaded upscaler DLL and
+    returns a real pipeline. FSR4 reports `compute PSO created via ACO ('ACCC')`
+    for all 29 passes instead of falling back to NewBE. FSR4 requires a 720p or
+    1080p internal render size; at 540p it refuses to initialize. The report's
+    `FFX_FSR4_XBOX_ACO=0` is not needed here and would force the NewBE path,
+    which this layer does not translate. On the RTX 2080, 720p FSR4 renders the
+    prologue at about 7 fps; three of the 29 passes are 64-lane programs that
+    still do not translate, so the own upscaler at 540p remains the playable
+    choice. See [NVIDIA-TESTING.md](NVIDIA-TESTING.md#rtx-2080--fsr4-aco-2026-11-27).
 
 ### Settings
 
